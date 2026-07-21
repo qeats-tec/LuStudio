@@ -2,7 +2,7 @@ import { useState, useCallback, useEffect } from 'react';
 import {
   Plus, FilePlus, FolderPlus,
   ChevronRight, ChevronDown, X, Save,
-  Terminal as TerminalIcon, Trash2, ArrowLeft,
+  Terminal as TerminalIcon, Trash2, ArrowLeft, Eye, Code2, Zap,
 } from 'lucide-react';
 import Editor from '@monaco-editor/react';
 import { Sidebar } from './components/Sidebar';
@@ -10,8 +10,10 @@ import { SettingsModal } from './components/SettingsModal';
 import { AIAssistant } from './components/AIAssistant';
 import { TerminalPanel } from './components/TerminalPanel';
 import { ProjectDashboard } from './components/ProjectDashboard';
+import { LivePreviewPanel } from './components/LivePreviewPanel';
+import { VisitorCounter } from './components/VisitorCounter';
 import { type AISettings } from './utils/ai';
-import type { FileNode, EditorTab, ChatMessage, AIFileAction, SidebarView, Project } from './types';
+import type { FileNode, EditorTab, ChatMessage, AIFileAction, AIStructuredAction, SidebarView, Project } from './types';
 
 const STORAGE_KEY_AI = 'lustudio_ai_settings';
 const STORAGE_KEY_PROJECTS = 'lustudio_projects';
@@ -37,6 +39,10 @@ function langForFile(name: string): string {
 
 function createFileNode(name: string, path: string, content = ''): FileNode {
   return { id: genId(), name, type: 'file', path, content, language: langForFile(name) };
+}
+
+function createFolderNode(name: string, path: string): FileNode {
+  return { id: genId(), name, type: 'folder', path, children: [] };
 }
 
 function flattenFiles(nodes: FileNode[], prefix = ''): string[] {
@@ -66,6 +72,40 @@ function updateNodeContent(nodes: FileNode[], path: string, content: string): Fi
     if (n.type === 'folder' && n.children) return { ...n, children: updateNodeContent(n.children, path, content) };
     return n;
   });
+}
+
+/**
+ * Resolve a structured action path into a normalized path relative to project root.
+ * e.g. { path: "/", name: "components" } -> "components"
+ *      { path: "utils", name: "helper.js" } -> "utils/helper.js"
+ */
+function resolveActionPath(actionPath: string, name: string): string {
+  let p = actionPath.trim();
+  if (p === '/' || p === '') return name;
+  if (p.endsWith('/')) p = p.slice(0, -1);
+  if (p.startsWith('/')) p = p.slice(1);
+  return `${p}/${name}`;
+}
+
+/**
+ * Ensure all parent folders for a given path exist in the tree, creating them as needed.
+ * Returns the updated tree.
+ */
+function ensureFolderPath(nodes: FileNode[], fullPath: string): FileNode[] {
+  const parts = fullPath.split('/').filter(Boolean);
+  if (parts.length <= 1) return nodes; // no parent folder needed
+  const folderParts = parts.slice(0, -1); // all but the filename
+  let currentNodes = nodes;
+  let currentPath = '';
+  for (const part of folderParts) {
+    currentPath = currentPath ? `${currentPath}/${part}` : part;
+    const existing = currentNodes.find((n) => n.path === currentPath && n.type === 'folder');
+    if (!existing) {
+      const newFolder = createFolderNode(part, currentPath);
+      currentNodes = [...currentNodes, newFolder];
+    }
+  }
+  return currentNodes;
 }
 
 function FileTreeItem({
@@ -144,6 +184,8 @@ export default function App() {
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [terminalOpen, setTerminalOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
+  const [mainView, setMainView] = useState<'editor' | 'preview' | 'split'>('editor');
+  const [autoRun, setAutoRun] = useState(true);
 
   const activeProject = projects.find((p) => p.id === activeProjectId) ?? null;
 
@@ -308,9 +350,16 @@ export default function App() {
         if (existing) {
           updated = updateNodeContent(updated, action.path, action.content);
         } else {
+          // Ensure parent folders exist
+          updated = ensureFolderPath(updated, action.path);
           const newNode = createFileNode(action.path.split('/').pop() ?? action.path, action.path, action.content);
           newNode.language = action.language;
           updated = [...updated, newNode];
+          // Auto-expand parent folder
+          const parentPath = action.path.includes('/') ? action.path.slice(0, action.path.lastIndexOf('/')) : '';
+          if (parentPath) {
+            setExpanded((e) => new Set(e).add(parentPath));
+          }
         }
       }
       return updated;
@@ -327,6 +376,63 @@ export default function App() {
     }
   }, [handleOpenFile]);
 
+  /**
+   * Handle structured JSON actions from AI: create_folder and create_file.
+   * Safely integrates with the existing file tree, creating parent folders as needed.
+   */
+  const handleApplyStructured = useCallback((actions: AIStructuredAction[]) => {
+    setFiles((prev) => {
+      let updated = prev;
+      const foldersToExpand: string[] = [];
+      for (const action of actions) {
+        if (action.action === 'create_folder') {
+          const fullPath = resolveActionPath(action.path, action.name);
+          if (findNode(updated, fullPath)) continue; // already exists
+          updated = ensureFolderPath(updated, fullPath);
+          const folder = createFolderNode(action.name, fullPath);
+          updated = [...updated, folder];
+          foldersToExpand.push(fullPath);
+          // Also expand parent
+          const parent = fullPath.includes('/') ? fullPath.slice(0, fullPath.lastIndexOf('/')) : '';
+          if (parent) foldersToExpand.push(parent);
+        } else if (action.action === 'create_file') {
+          const fullPath = resolveActionPath(action.path, action.name);
+          const existing = findNode(updated, fullPath);
+          if (existing) {
+            updated = updateNodeContent(updated, fullPath, action.content);
+          } else {
+            updated = ensureFolderPath(updated, fullPath);
+            const newNode = createFileNode(action.name, fullPath, action.content);
+            newNode.language = action.language;
+            updated = [...updated, newNode];
+            const parent = fullPath.includes('/') ? fullPath.slice(0, fullPath.lastIndexOf('/')) : '';
+            if (parent) foldersToExpand.push(parent);
+          }
+        }
+      }
+      if (foldersToExpand.length > 0) {
+        setExpanded((e) => {
+          const next = new Set(e);
+          for (const f of foldersToExpand) next.add(f);
+          return next;
+        });
+      }
+      return updated;
+    });
+    // Open the first created file if any
+    const firstFile = actions.find((a) => a.action === 'create_file');
+    if (firstFile && firstFile.action === 'create_file') {
+      const fullPath = resolveActionPath(firstFile.path, firstFile.name);
+      setTimeout(() => {
+        setFiles((prev) => {
+          const n = findNode(prev, fullPath);
+          if (n) handleOpenFile(n);
+          return prev;
+        });
+      }, 50);
+    }
+  }, [handleOpenFile]);
+
   const fileList = flattenFiles(files);
   const searchResults = searchQuery
     ? fileList.filter((f) => f.toLowerCase().includes(searchQuery.toLowerCase()))
@@ -335,13 +441,20 @@ export default function App() {
   // Dashboard view
   if (!activeProject) {
     return (
-      <ProjectDashboard
-        projects={projects}
-        onOpenProject={setActiveProjectId}
-        onCreateProject={handleCreateProject}
-        onDeleteProject={handleDeleteProject}
-        onRenameProject={handleRenameProject}
-      />
+      <>
+        <ProjectDashboard
+          projects={projects}
+          onOpenProject={setActiveProjectId}
+          onCreateProject={handleCreateProject}
+          onDeleteProject={handleDeleteProject}
+          onRenameProject={handleRenameProject}
+        />
+        <div className="pointer-events-none fixed bottom-4 right-4 z-50">
+          <div className="pointer-events-auto rounded-full border border-coal-800 bg-coal-900/80 px-3 py-1.5 shadow-lg backdrop-blur-sm">
+            <VisitorCounter />
+          </div>
+        </div>
+      </>
     );
   }
 
@@ -357,7 +470,26 @@ export default function App() {
           <span className="text-sm font-semibold text-coal-100">{activeProject.name}</span>
           {activeTab?.dirty && <span className="text-xs text-coal-500">— unsaved changes</span>}
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-3">
+          {/* Editor / Preview / Split view toggle */}
+          <div className="flex items-center gap-0.5 rounded-md bg-coal-850 p-0.5">
+            <button onClick={() => setMainView('editor')} title="Editör"
+              className={`flex items-center gap-1 rounded px-2 py-1 text-[11px] transition-colors ${mainView === 'editor' ? 'bg-coal-700 text-accent-400' : 'text-coal-400 hover:text-coal-200'}`}>
+              <Code2 size={12} /> Editör
+            </button>
+            <button onClick={() => setMainView('split')} title="Bölünmüş"
+              className={`flex items-center gap-1 rounded px-2 py-1 text-[11px] transition-colors ${mainView === 'split' ? 'bg-coal-700 text-accent-400' : 'text-coal-400 hover:text-coal-200'}`}>
+              <Plus size={12} /> Böl
+            </button>
+            <button onClick={() => setMainView('preview')} title="Önizleme"
+              className={`flex items-center gap-1 rounded px-2 py-1 text-[11px] transition-colors ${mainView === 'preview' ? 'bg-coal-700 text-accent-400' : 'text-coal-400 hover:text-coal-200'}`}>
+              <Eye size={12} /> Önizle
+            </button>
+          </div>
+          <button onClick={() => setAutoRun((a) => !a)} title={autoRun ? 'Otomatik çalıştırma açık' : 'Otomatik çalıştırma kapalı'}
+            className={`flex items-center gap-1 text-xs transition-colors ${autoRun ? 'text-accent-400' : 'text-coal-500 hover:text-coal-300'}`}>
+            <Zap size={12} /> Auto
+          </button>
           {aiSettings.apiKey ? (
             <span className="flex items-center gap-1 text-xs text-accent-400">
               <span className="h-1.5 w-1.5 rounded-full bg-accent-400" /> AI Ready
@@ -367,6 +499,7 @@ export default function App() {
               <span className="h-1.5 w-1.5 rounded-full bg-coal-600" /> AI Off
             </span>
           )}
+          <VisitorCounter />
         </div>
       </div>
 
@@ -458,23 +591,35 @@ export default function App() {
             </div>
           )}
 
-          <div className="flex-1 overflow-hidden">
-            {activeTab ? (
-              <Editor value={activeTab.content} language={activeTab.language} onChange={handleEditorChange}
-                theme="vs-dark"
-                options={{
-                  fontSize: 14, fontFamily: '"JetBrains Mono", "Fira Code", monospace',
-                  minimap: { enabled: false }, scrollBeyondLastLine: false,
-                  padding: { top: 12, bottom: 12 }, lineNumbers: 'on', tabSize: 2, automaticLayout: true,
-                }} />
-            ) : (
-              <div className="flex h-full items-center justify-center text-coal-500">
-                <div className="text-center">
-                  <div className="mx-auto mb-3 flex h-16 w-16 items-center justify-center rounded-2xl bg-coal-850">
-                    <Plus size={28} className="text-coal-600" />
+          <div className="flex flex-1 overflow-hidden">
+            {/* Editor area */}
+            {(mainView === 'editor' || mainView === 'split') && (
+              <div className={`flex flex-col overflow-hidden ${mainView === 'split' ? 'flex-1 border-r border-coal-800' : 'flex-1'}`}>
+                {activeTab ? (
+                  <Editor value={activeTab.content} language={activeTab.language} onChange={handleEditorChange}
+                    theme="vs-dark"
+                    options={{
+                      fontSize: 14, fontFamily: '"JetBrains Mono", "Fira Code", monospace',
+                      minimap: { enabled: false }, scrollBeyondLastLine: false,
+                      padding: { top: 12, bottom: 12 }, lineNumbers: 'on', tabSize: 2, automaticLayout: true,
+                    }} />
+                ) : (
+                  <div className="flex h-full items-center justify-center text-coal-500">
+                    <div className="text-center">
+                      <div className="mx-auto mb-3 flex h-16 w-16 items-center justify-center rounded-2xl bg-coal-850">
+                        <Plus size={28} className="text-coal-600" />
+                      </div>
+                      <p className="text-sm">Open a file or create a new one to start coding</p>
+                    </div>
                   </div>
-                  <p className="text-sm">Open a file or create a new one to start coding</p>
-                </div>
+                )}
+              </div>
+            )}
+
+            {/* Live Preview area */}
+            {(mainView === 'preview' || mainView === 'split') && (
+              <div className={mainView === 'split' ? 'flex-1' : 'flex-1'}>
+                <LivePreviewPanel files={files} activeTabName={activeTab?.name ?? null} autoRun={autoRun} />
               </div>
             )}
           </div>
@@ -500,7 +645,8 @@ export default function App() {
         aiSettings={aiSettings}
         onOpenSettings={() => { setAiOpen(false); setSettingsOpen(true); }}
         selectedCode="" activeLanguage={activeTab?.language ?? 'plaintext'}
-        fileList={fileList} onApplyFiles={handleApplyFiles} />
+        fileList={fileList} onApplyFiles={handleApplyFiles}
+        onApplyStructured={handleApplyStructured} />
 
       <SettingsModal open={settingsOpen} onClose={() => setSettingsOpen(false)}
         settings={aiSettings} onSettingsChange={handleAiSettingsChange} />

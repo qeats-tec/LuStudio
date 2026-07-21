@@ -34,6 +34,10 @@ export interface AIFileAction {
   language: string;
 }
 
+export type AIStructuredAction =
+  | { action: 'create_folder'; name: string; path: string }
+  | { action: 'create_file'; name: string; path: string; content: string; language: string };
+
 export interface Project {
   id: string;
   name: string;
