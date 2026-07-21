@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react';
 import { supabase } from '../lib/supabase';
 
+
+
 const FINGERPRINT_KEY = 'lustudio_visitor_fp';
 
 function getFingerprint(): string {
@@ -20,7 +22,7 @@ export function useVisitorCount() {
     let cancelled = false;
 
     async function registerAndCount() {
-      if (!import.meta.env.VITE_SUPABASE_URL) return;
+      if (!supabase) return;
       const fp = getFingerprint();
 
       // Upsert this visitor (insert if new, update last_seen if returning)
