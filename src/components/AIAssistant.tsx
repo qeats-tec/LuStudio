@@ -38,6 +38,17 @@ export function AIAssistant({
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
   }, [messages, loading]);
 
+  // Precompute parsed actions for all messages (hooks must not be called in loops)
+  const messageActions = useMemo(() => {
+    return messages.map((msg) => {
+      if (msg.role !== 'assistant' || msg.pending) return { fileActions: [] as AIFileAction[], structuredActions: [] as AIStructuredAction[] };
+      return {
+        fileActions: parseAIFileActions(msg.content),
+        structuredActions: parseAIStructuredActions(msg.content),
+      };
+    });
+  }, [messages]);
+
   if (!open) return null;
 
   const handleSend = async () => {
@@ -127,12 +138,8 @@ export function AIAssistant({
           </div>
         )}
 
-        {messages.map((msg) => {
-          const fileActions = useMemo(() => (msg.role === 'assistant' && !msg.pending ? parseAIFileActions(msg.content) : []), [msg]);
-          const structuredActions = useMemo(
-            () => (msg.role === 'assistant' && !msg.pending ? parseAIStructuredActions(msg.content) : []),
-            [msg],
-          );
+        {messages.map((msg, idx) => {
+          const { fileActions, structuredActions } = messageActions[idx] ?? { fileActions: [], structuredActions: [] };
           const hasActions = fileActions.length > 0 || structuredActions.length > 0;
           const wasApplied = appliedIds.has(msg.id);
           // Strip action tags from displayed text
