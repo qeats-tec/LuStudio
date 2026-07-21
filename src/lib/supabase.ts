@@ -12,6 +12,3 @@ if (!supabase) {
   // eslint-disable-next-line no-console
   console.warn('[supabase] Missing env vars — visitor counter disabled');
 }
-
-
-export { supabase }
