@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useMemo } from 'react';
-import { X, Send, Sparkles, AlertCircle, Loader2, Settings as SettingsIcon, FolderPlus, FilePlus, Check } from 'lucide-react';
+import { X, Send, Sparkles, CircleAlert as AlertCircle, Loader as Loader2, Settings as SettingsIcon, FolderPlus, FilePlus, Check } from 'lucide-react';
 import type { ChatMessage, AIFileAction, AIStructuredAction } from '../types';
 import { callAI, parseAIFileActions, parseAIStructuredActions, buildSystemPrompt, type AISettings } from '../utils/ai';
 import { CodeCard } from './CodeCard';

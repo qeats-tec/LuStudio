@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useRef } from 'react';
-import { RefreshCw, ExternalLink, Monitor, Smartphone, Tablet, Eye, Play, Loader2 } from 'lucide-react';
+import { RefreshCw, ExternalLink, Monitor, Smartphone, Tablet, Eye, Play, Loader as Loader2 } from 'lucide-react';
 import type { FileNode } from '../types';
 
 interface LivePreviewPanelProps {

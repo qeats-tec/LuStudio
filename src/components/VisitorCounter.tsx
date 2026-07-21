@@ -1,4 +1,4 @@
-import { Users, Loader2 } from 'lucide-react';
+import { Users, Loader as Loader2 } from 'lucide-react';
 import { useVisitorCount } from '../hooks/useVisitorCount';
 
 export function VisitorCounter() {

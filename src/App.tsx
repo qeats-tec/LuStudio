@@ -1,9 +1,5 @@
 import { useState, useCallback, useEffect } from 'react';
-import {
-  Plus, FilePlus, FolderPlus,
-  ChevronRight, ChevronDown, X, Save,
-  Terminal as TerminalIcon, Trash2, ArrowLeft, Eye, Code2, Zap,
-} from 'lucide-react';
+import { Plus, FilePlus, FolderPlus, ChevronRight, ChevronDown, X, Save, Terminal as TerminalIcon, Trash2, ArrowLeft, Eye, Code as Code2, Zap } from 'lucide-react';
 import Editor from '@monaco-editor/react';
 import { Sidebar } from './components/Sidebar';
 import { SettingsModal } from './components/SettingsModal';
