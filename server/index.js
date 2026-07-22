@@ -29,6 +29,10 @@ function getShell() {
 }
 
 function getWorkspaceDir() {
+  // Project root is the parent of the server/ directory
+  const projectRoot = path.resolve(__dirname, '..');
+  if (fs.existsSync(path.join(projectRoot, 'package.json'))) return projectRoot;
+  // Fallback to HOME if project root doesn't look like a project
   const dir = process.env.HOME || '/tmp';
   if (!fs.existsSync(dir)) {
     try {
