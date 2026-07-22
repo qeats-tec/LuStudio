@@ -8,6 +8,8 @@ const TERMINAL_WS_URL = (() => {
   return `${proto}://${window.location.host}/terminal`;
 })();
 
+const encoder = new TextEncoder();
+
 export default function TerminalInner() {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<XTerm | null>(null);
@@ -45,6 +47,9 @@ export default function TerminalInner() {
         brightWhite: '#f5f5f5',
       },
       allowProposedApi: true,
+      // Performance: write directly without DOM batching
+      fastScrollModifier: 'alt',
+      scrollback: 5000,
     });
 
     const fit = new FitAddon();
@@ -58,23 +63,34 @@ export default function TerminalInner() {
     term.writeln('\x1b[33mLuStudio Terminal\x1b[0m — connecting...');
 
     const connect = () => {
+      // binaryType = arraybuffer for fast binary reads
       const ws = new WebSocket(TERMINAL_WS_URL);
+      ws.binaryType = 'arraybuffer';
       wsRef.current = ws;
 
       ws.onopen = () => {
         setConnected(true);
         term.writeln('\x1b[32m✓ Connected\x1b[0m');
+        // Send resize as text (JSON control message)
         ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
       };
 
       ws.onmessage = (event) => {
-        try {
-          const msg = JSON.parse(event.data);
-          if (msg.type === 'data') term.write(msg.data);
-          else if (msg.type === 'exit')
-            term.writeln(`\r\n\x1b[33m[process exited with code ${msg.exitCode}]\x1b[0m`);
-        } catch {
-          /* ignore */
+        if (event.data instanceof ArrayBuffer) {
+          // Binary frame = raw terminal output — decode and write directly
+          const text = new TextDecoder('utf-8').decode(event.data);
+          term.write(text);
+        } else {
+          // Text frame = JSON control message
+          try {
+            const msg = JSON.parse(event.data);
+            if (msg.type === 'exit')
+              term.writeln(`\r\n\x1b[33m[process exited with code ${msg.exitCode}]\x1b[0m`);
+            else if (msg.type === 'error')
+              term.writeln(`\r\n\x1b[31m✗ ${msg.message}\x1b[0m`);
+          } catch {
+            /* ignore */
+          }
         }
       };
 
@@ -82,27 +98,35 @@ export default function TerminalInner() {
 
       ws.onclose = () => {
         setConnected(false);
-        term.writeln('\r\n\x1b[31m✗ Disconnected. Reconnecting in 3s...\x1b[0m');
+        term.writeln('\r\n\x1b[31m✗ Disconnected. Reconnecting in 2s...\x1b[0m');
         setTimeout(() => {
           if (wsRef.current === ws) connect();
-        }, 3000);
+        }, 2000);
       };
     };
 
     connect();
 
     const inputDisposable = term.onData((data) => {
-      if (wsRef.current?.readyState === WebSocket.OPEN)
-        wsRef.current.send(JSON.stringify({ type: 'input', data }));
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        // Send raw bytes as binary frame — no JSON wrapping
+        wsRef.current.send(encoder.encode(data));
+      }
     });
 
+    let resizeTimer: ReturnType<typeof setTimeout> | null = null;
     const resizeObserver = new ResizeObserver(() => {
       if (fitRef.current && termRef.current) {
         fitRef.current.fit();
-        if (wsRef.current?.readyState === WebSocket.OPEN)
-          wsRef.current.send(
-            JSON.stringify({ type: 'resize', cols: termRef.current.cols, rows: termRef.current.rows }),
-          );
+        // Debounce resize events
+        if (resizeTimer) clearTimeout(resizeTimer);
+        resizeTimer = setTimeout(() => {
+          if (wsRef.current?.readyState === WebSocket.OPEN && termRef.current) {
+            wsRef.current.send(
+              JSON.stringify({ type: 'resize', cols: termRef.current.cols, rows: termRef.current.rows }),
+            );
+          }
+        }, 100);
       }
     });
     resizeObserver.observe(containerRef.current);
@@ -110,6 +134,7 @@ export default function TerminalInner() {
     return () => {
       inputDisposable.dispose();
       resizeObserver.disconnect();
+      if (resizeTimer) clearTimeout(resizeTimer);
       wsRef.current?.close();
       wsRef.current = null;
       term.dispose();
@@ -120,7 +145,7 @@ export default function TerminalInner() {
 
   return (
     <div className="relative h-full">
-      <div className="absolute left-2 top-1 z-10 flex items-center gap-1.5 text-xs text-coal-500 pointer-events-none">
+      <div className="absolute left-2 top-1 z-10 flex items-center resize-none items-center gap-1.5 text-xs text-coal-500 pointer-events-none">
         <div className={`h-1.5 w-1.5 rounded-full ${connected ? 'bg-green-500' : 'bg-red-500'}`} />
         <span>{connected ? 'connected' : 'disconnected'}</span>
       </div>

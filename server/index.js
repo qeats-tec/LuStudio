@@ -19,8 +19,7 @@ if (fs.existsSync(distPath)) {
 
 const server = http.createServer(app);
 
-// WebSocket server for terminals — mounted on /terminal
-import { WebSocketServer } from 'ws';
+import { WebSocketServer, WebSocket } from 'ws';
 const wss = new WebSocketServer({ server, path: '/terminal' });
 
 const terminals = new Map();
@@ -31,18 +30,18 @@ function getShell() {
 }
 
 function getWorkspaceDir() {
-  // 1) Where the app was launched from (Render runs `npm start` from project root)
   const cwd = process.cwd();
   if (fs.existsSync(path.join(cwd, 'package.json'))) return cwd;
-  // 2) Parent of server/ directory
   const projectRoot = path.resolve(__dirname, '..');
   if (fs.existsSync(path.join(projectRoot, 'package.json'))) return projectRoot;
-  // 3) HOME
   const home = process.env.HOME || '/tmp';
   if (fs.existsSync(home)) return home;
-  // 4) Last resort
   return '/tmp';
 }
+
+// Binary protocol:
+// - Binary frames = raw terminal data (both directions)
+// - Text frames   = JSON control messages: { type: "resize", cols, rows } | { type: "exit", exitCode }
 
 wss.on('connection', (ws, req) => {
   const id = Math.random().toString(36).slice(2);
@@ -62,78 +61,94 @@ wss.on('connection', (ws, req) => {
         ...process.env,
         TERM: 'xterm-256color',
         FORCE_COLOR: '1',
+        COLORTERM: 'truecolor',
       },
     });
   } catch (err) {
     console.error('[terminal] pty spawn failed:', err.message);
-    ws.send(
-      JSON.stringify({
-        type: 'data',
-        data: '\r\n\x1b[33m*** Terminal backend not available in this environment ***\x1b[0m\r\n$ ',
-      }),
-    );
-    ws.on('message', (msg) => {
-      try {
-        const data = JSON.parse(msg.toString());
-        if (data.type === 'input' && data.data) {
-          ws.send(JSON.stringify({ type: 'data', data: data.data }));
-          if (data.data === '\r') ws.send(JSON.stringify({ type: 'data', data: '\r\n$ ' }));
-        }
-      } catch {
-        /* ignore */
-      }
-    });
-    ws.on('close', () => console.log(`[terminal] fallback ${id} closed`));
+    ws.send(JSON.stringify({ type: 'error', message: 'Terminal backend not available' }));
+    ws.close();
     return;
   }
 
   terminals.set(id, term);
 
+  // Output buffer: batch small writes into larger frames for throughput
+  let outputBuffer = [];
+  let flushTimer = null;
+  const FLUSH_MS = 8; // batch window
+  const MAX_BUFFER = 65536; // flush immediately if buffer gets this big
+
+  function flushOutput() {
+    flushTimer = null;
+    if (outputBuffer.length === 0) return;
+    const merged = Buffer.concat(outputBuffer);
+    outputBuffer = [];
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(merged); // binary frame — zero JSON overhead
+    }
+  }
+
+  function scheduleFlush() {
+    if (outputBuffer.length > 0 && outputBuffer.reduce((a, b) => a + b.length, 0) >= MAX_BUFFER) {
+      if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+      flushOutput();
+      return;
+    }
+    if (!flushTimer) {
+      flushTimer = setTimeout(flushOutput, FLUSH_MS);
+    }
+  }
+
   term.onData((data) => {
-    if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'data', data }));
+    outputBuffer.push(Buffer.from(data, 'utf8'));
+    scheduleFlush();
   });
 
   term.onExit(({ exitCode }) => {
     console.log(`[terminal] shell ${id} exited: ${exitCode}`);
-    if (ws.readyState === ws.OPEN) {
-      ws.send(JSON.stringify({ type: 'exit', exitCode }));
+    if (flushTimer) { clearTimeout(flushTimer); flushOutput(); }
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'exit', exitCode })); // text frame = control
       ws.close();
     }
     terminals.delete(id);
   });
 
-  ws.on('message', (msg) => {
-    try {
-      const data = JSON.parse(msg.toString());
-      if (data.type === 'input' && data.data !== undefined) {
-        term.write(data.data);
-      } else if (data.type === 'resize') {
-        const cols = Math.max(1, data.cols || 80);
-        const rows = Math.max(1, data.rows || 24);
-        term.resize(cols, rows);
+  ws.on('message', (msg, isBinary) => {
+    if (isBinary) {
+      // Binary frame = raw terminal input
+      try {
+        term.write(msg);
+      } catch (e) {
+        console.error('[terminal] write error:', e.message);
       }
-    } catch (e) {
-      console.error('[terminal] parse error:', e.message);
+    } else {
+      // Text frame = JSON control message
+      try {
+        const data = JSON.parse(msg.toString());
+        if (data.type === 'resize') {
+          const cols = Math.max(1, data.cols || 80);
+          const rows = Math.max(1, data.rows || 24);
+          term.resize(cols, rows);
+        }
+      } catch (e) {
+        console.error('[terminal] control parse error:', e.message);
+      }
     }
   });
 
   ws.on('close', () => {
     console.log(`[terminal] connection ${id} closed`);
-    try {
-      term.kill();
-    } catch {
-      /* ignore */
-    }
+    if (flushTimer) { clearTimeout(flushTimer); }
+    try { term.kill(); } catch { /* ignore */ }
     terminals.delete(id);
   });
 
   ws.on('error', (err) => {
     console.error(`[terminal] ws error ${id}:`, err.message);
-    try {
-      term.kill();
-    } catch {
-      /* ignore */
-    }
+    if (flushTimer) { clearTimeout(flushTimer); }
+    try { term.kill(); } catch { /* ignore */ }
     terminals.delete(id);
   });
 });
@@ -156,24 +171,12 @@ server.listen(PORT, HOST, () => {
   console.log(`Shell: ${getShell()} | Workspace: ${getWorkspaceDir()}`);
 });
 
-process.on('SIGTERM', () => {
+function shutdown() {
   for (const [, term] of terminals) {
-    try {
-      term.kill();
-    } catch {
-      /* ignore */
-    }
+    try { term.kill(); } catch { /* ignore */ }
   }
   server.close(() => process.exit(0));
-});
+}
 
-process.on('SIGINT', () => {
-  for (const [, term] of terminals) {
-    try {
-      term.kill();
-    } catch {
-      /* ignore */
-    }
-  }
-  server.close(() => process.exit(0));
-});
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
