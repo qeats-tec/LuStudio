@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect } from 'react';
-import { Plus, FilePlus, FolderPlus, ChevronRight, ChevronDown, X, Save, Terminal as TerminalIcon, Trash2, ArrowLeft, Eye, Code as Code2, Zap } from 'lucide-react';
+import { Plus, FilePlus, FolderPlus, ChevronRight, ChevronDown, X, Save, Terminal as TerminalIcon, Trash2, ArrowLeft, Eye, Code as Code2, Zap, RefreshCw } from 'lucide-react';
 import Editor from '@monaco-editor/react';
 import { Sidebar } from './components/Sidebar';
 import { SettingsModal } from './components/SettingsModal';
@@ -9,7 +9,11 @@ import { ProjectDashboard } from './components/ProjectDashboard';
 import { LivePreviewPanel } from './components/LivePreviewPanel';
 import { VisitorCounter } from './components/VisitorCounter';
 import { type AISettings } from './utils/ai';
-import type { FileNode, EditorTab, ChatMessage, AIFileAction, AIStructuredAction, SidebarView, Project } from './types';
+import type { FileNode, EditorTab, ChatMessage, AIFileAction, AIStructuredAction, SidebarView } from './types';
+import {
+  fetchTree, fetchFileContent, saveFile, createFileOrFolder, deleteFile,
+  serverNodeToFileNode, flattenFiles, findNode, langForFile,
+} from './lib/filesystem';
 
 const STORAGE_KEY_AI = 'lustudio_ai_settings';
 const STORAGE_KEY_PROJECTS = 'lustudio_projects';
@@ -19,89 +23,12 @@ function genId() {
   return crypto.randomUUID();
 }
 
-function getExt(name: string): string {
-  return name.split('.').pop()?.toLowerCase() ?? '';
-}
-
-function langForFile(name: string): string {
-  const ext = getExt(name);
-  const map: Record<string, string> = {
-    ts: 'typescript', tsx: 'tsx', js: 'javascript', jsx: 'jsx',
-    json: 'json', css: 'css', html: 'html', md: 'markdown',
-    py: 'python', go: 'go', rs: 'rust', txt: 'plaintext',
-  };
-  return map[ext] ?? 'plaintext';
-}
-
-function createFileNode(name: string, path: string, content = ''): FileNode {
-  return { id: genId(), name, type: 'file', path, content, language: langForFile(name) };
-}
-
-function createFolderNode(name: string, path: string): FileNode {
-  return { id: genId(), name, type: 'folder', path, children: [] };
-}
-
-function flattenFiles(nodes: FileNode[], prefix = ''): string[] {
-  const result: string[] = [];
-  for (const n of nodes) {
-    const p = prefix ? `${prefix}/${n.name}` : n.name;
-    if (n.type === 'folder') result.push(...flattenFiles(n.children ?? [], p));
-    else result.push(p);
-  }
-  return result;
-}
-
-function findNode(nodes: FileNode[], path: string): FileNode | null {
-  for (const n of nodes) {
-    if (n.path === path) return n;
-    if (n.type === 'folder' && n.children) {
-      const found = findNode(n.children, path);
-      if (found) return found;
-    }
-  }
-  return null;
-}
-
-function updateNodeContent(nodes: FileNode[], path: string, content: string): FileNode[] {
-  return nodes.map((n) => {
-    if (n.path === path) return { ...n, content };
-    if (n.type === 'folder' && n.children) return { ...n, children: updateNodeContent(n.children, path, content) };
-    return n;
-  });
-}
-
-/**
- * Resolve a structured action path into a normalized path relative to project root.
- * e.g. { path: "/", name: "components" } -> "components"
- *      { path: "utils", name: "helper.js" } -> "utils/helper.js"
- */
 function resolveActionPath(actionPath: string, name: string): string {
   let p = actionPath.trim();
   if (p === '/' || p === '') return name;
   if (p.endsWith('/')) p = p.slice(0, -1);
   if (p.startsWith('/')) p = p.slice(1);
   return `${p}/${name}`;
-}
-
-/**
- * Ensure all parent folders for a given path exist in the tree, creating them as needed.
- * Returns the updated tree.
- */
-function ensureFolderPath(nodes: FileNode[], fullPath: string): FileNode[] {
-  const parts = fullPath.split('/').filter(Boolean);
-  if (parts.length <= 1) return nodes; // no parent folder needed
-  const folderParts = parts.slice(0, -1); // all but the filename
-  let currentNodes = nodes;
-  let currentPath = '';
-  for (const part of folderParts) {
-    currentPath = currentPath ? `${currentPath}/${part}` : part;
-    const existing = currentNodes.find((n) => n.path === currentPath && n.type === 'folder');
-    if (!existing) {
-      const newFolder = createFolderNode(part, currentPath);
-      currentNodes = [...currentNodes, newFolder];
-    }
-  }
-  return currentNodes;
 }
 
 function FileTreeItem({
@@ -169,6 +96,8 @@ export default function App() {
   const [activeProjectId, setActiveProjectId] = useState<string | null>(() => {
     return localStorage.getItem(STORAGE_KEY_ACTIVE) || null;
   });
+
+  // Server filesystem state — replaces the old in-memory file tree
   const [files, setFiles] = useState<FileNode[]>([]);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [tabs, setTabs] = useState<EditorTab[]>([]);
@@ -182,30 +111,35 @@ export default function App() {
   const [searchQuery, setSearchQuery] = useState('');
   const [mainView, setMainView] = useState<'editor' | 'preview' | 'split'>('editor');
   const [autoRun, setAutoRun] = useState(true);
+  const [treeLoading, setTreeLoading] = useState(false);
+  const [treeError, setTreeError] = useState<string | null>(null);
 
   const activeProject = projects.find((p) => p.id === activeProjectId) ?? null;
 
-  // Load files when project changes
+  // Fetch the real file tree from the server filesystem
+  const refreshTree = useCallback(async () => {
+    setTreeLoading(true);
+    setTreeError(null);
+    try {
+      const { tree } = await fetchTree();
+      setFiles(tree.map(serverNodeToFileNode));
+    } catch (err) {
+      setTreeError(err instanceof Error ? err.message : 'Failed to load files');
+    } finally {
+      setTreeLoading(false);
+    }
+  }, []);
+
+  // Load tree on mount (when a project is active)
   useEffect(() => {
     if (activeProject) {
-      setFiles(activeProject.files);
-      setExpanded(new Set());
-      setTabs([]);
-      setActiveTabId(null);
+      refreshTree();
     } else {
       setFiles([]);
       setTabs([]);
       setActiveTabId(null);
     }
   }, [activeProjectId]);
-
-  // Persist projects whenever files change (debounced via effect)
-  useEffect(() => {
-    if (!activeProjectId) return;
-    setProjects((prev) => prev.map((p) =>
-      p.id === activeProjectId ? { ...p, files, updatedAt: Date.now() } : p
-    ));
-  }, [files]);
 
   // Persist projects list
   useEffect(() => {
@@ -259,12 +193,21 @@ export default function App() {
     });
   }, []);
 
-  const handleOpenFile = useCallback((node: FileNode) => {
+  const handleOpenFile = useCallback(async (node: FileNode) => {
     const existing = tabs.find((t) => t.path === node.path);
     if (existing) { setActiveTabId(existing.id); return; }
+
+    // Fetch content from server
+    let content = node.content ?? '';
+    try {
+      content = await fetchFileContent(node.path);
+    } catch {
+      // use cached content if fetch fails
+    }
+
     const tab: EditorTab = {
       id: genId(), name: node.name, path: node.path,
-      content: node.content ?? '', language: node.language ?? 'plaintext', dirty: false,
+      content, language: node.language ?? langForFile(node.name), dirty: false,
     };
     setTabs((prev) => [...prev, tab]);
     setActiveTabId(tab.id);
@@ -289,18 +232,25 @@ export default function App() {
     setTabs((prev) => prev.map((t) => (t.id === activeTabId ? { ...t, content: value ?? '', dirty: true } : t)));
   }, [activeTabId]);
 
-  const handleSave = useCallback(() => {
+  const handleSave = useCallback(async () => {
     if (!activeTab) return;
-    setFiles((prev) => updateNodeContent(prev, activeTab.path, activeTab.content));
-    setTabs((prev) => prev.map((t) => (t.id === activeTab.id ? { ...t, dirty: false } : t)));
+    try {
+      await saveFile(activeTab.path, activeTab.content);
+      setTabs((prev) => prev.map((t) => (t.id === activeTab.id ? { ...t, dirty: false } : t)));
+    } catch (err) {
+      console.error('Save failed:', err);
+    }
   }, [activeTab]);
 
-  const handleSaveAll = useCallback(() => {
-    setFiles((prev) => {
-      let updated = prev;
-      for (const tab of tabs) { if (tab.dirty) updated = updateNodeContent(updated, tab.path, tab.content); }
-      return updated;
-    });
+  const handleSaveAll = useCallback(async () => {
+    const dirtyTabs = tabs.filter((t) => t.dirty);
+    for (const tab of dirtyTabs) {
+      try {
+        await saveFile(tab.path, tab.content);
+      } catch (err) {
+        console.error('Save failed:', err);
+      }
+    }
     setTabs((prev) => prev.map((t) => ({ ...t, dirty: false })));
   }, [tabs]);
 
@@ -312,110 +262,74 @@ export default function App() {
     return () => window.removeEventListener('keydown', handler);
   }, [handleSaveAll]);
 
-  const handleNewFile = useCallback(() => {
+  const handleNewFile = useCallback(async () => {
     const name = prompt('File name (e.g. App.tsx):');
     if (!name) return;
-    const node = createFileNode(name, name, '');
-    setFiles((prev) => [...prev, node]);
-    handleOpenFile(node);
-  }, [handleOpenFile]);
+    try {
+      await createFileOrFolder(name, 'file');
+      await refreshTree();
+      const node = findNode(files, name);
+      if (node) handleOpenFile(node);
+    } catch (err) {
+      console.error('Create file failed:', err);
+    }
+  }, [refreshTree, files, handleOpenFile]);
 
-  const handleDeleteNode = useCallback((path: string) => {
-    if (!confirm(`Delete "${path}"?`)) return;
-    setFiles((prev) => {
-      const filterNodes = (nodes: FileNode[]): FileNode[] =>
-        nodes.filter((n) => n.path !== path).map((n) =>
-          n.type === 'folder' && n.children ? { ...n, children: filterNodes(n.children) } : n
-        );
-      return filterNodes(prev);
-    });
-    setTabs((prev) => {
-      const filtered = prev.filter((t) => !t.path.startsWith(path + '/') && t.path !== path);
-      if (activeTabId && !filtered.find((t) => t.id === activeTabId)) {
-        setActiveTabId(filtered[0]?.id ?? null);
-      }
-      return filtered;
-    });
-  }, [activeTabId]);
-
-  const handleApplyFiles = useCallback((actions: AIFileAction[]) => {
-    setFiles((prev) => {
-      let updated = prev;
-      for (const action of actions) {
-        const existing = findNode(updated, action.path);
-        if (existing) {
-          updated = updateNodeContent(updated, action.path, action.content);
-        } else {
-          // Ensure parent folders exist
-          updated = ensureFolderPath(updated, action.path);
-          const newNode = createFileNode(action.path.split('/').pop() ?? action.path, action.path, action.content);
-          newNode.language = action.language;
-          updated = [...updated, newNode];
-          // Auto-expand parent folder
-          const parentPath = action.path.includes('/') ? action.path.slice(0, action.path.lastIndexOf('/')) : '';
-          if (parentPath) {
-            setExpanded((e) => new Set(e).add(parentPath));
-          }
+  const handleDeleteNode = useCallback(async (filePath: string) => {
+    if (!confirm(`Delete "${filePath}"?`)) return;
+    try {
+      await deleteFile(filePath);
+      await refreshTree();
+      setTabs((prev) => {
+        const filtered = prev.filter((t) => !t.path.startsWith(filePath + '/') && t.path !== filePath);
+        if (activeTabId && !filtered.find((t) => t.id === activeTabId)) {
+          setActiveTabId(filtered[0]?.id ?? null);
         }
+        return filtered;
+      });
+    } catch (err) {
+      console.error('Delete failed:', err);
+    }
+  }, [refreshTree, activeTabId]);
+
+  const handleApplyFiles = useCallback(async (actions: AIFileAction[]) => {
+    for (const action of actions) {
+      try {
+        await saveFile(action.path, action.content);
+      } catch (err) {
+        console.error('Apply file failed:', err);
       }
-      return updated;
-    });
+    }
+    await refreshTree();
     if (actions.length > 0) {
       const first = actions[0];
       setTimeout(() => {
-        setFiles((prev) => {
-          const n = findNode(prev, first.path);
-          if (n) handleOpenFile(n);
-          return prev;
+        refreshTree().then(() => {
+          setFiles((prev) => {
+            const n = findNode(prev, first.path);
+            if (n) handleOpenFile(n);
+            return prev;
+          });
         });
       }, 50);
     }
-  }, [handleOpenFile]);
+  }, [refreshTree, handleOpenFile]);
 
-  /**
-   * Handle structured JSON actions from AI: create_folder and create_file.
-   * Safely integrates with the existing file tree, creating parent folders as needed.
-   */
-  const handleApplyStructured = useCallback((actions: AIStructuredAction[]) => {
-    setFiles((prev) => {
-      let updated = prev;
-      const foldersToExpand: string[] = [];
-      for (const action of actions) {
+  const handleApplyStructured = useCallback(async (actions: AIStructuredAction[]) => {
+    for (const action of actions) {
+      try {
         if (action.action === 'create_folder') {
           const fullPath = resolveActionPath(action.path, action.name);
-          if (findNode(updated, fullPath)) continue; // already exists
-          updated = ensureFolderPath(updated, fullPath);
-          const folder = createFolderNode(action.name, fullPath);
-          updated = [...updated, folder];
-          foldersToExpand.push(fullPath);
-          // Also expand parent
-          const parent = fullPath.includes('/') ? fullPath.slice(0, fullPath.lastIndexOf('/')) : '';
-          if (parent) foldersToExpand.push(parent);
+          await createFileOrFolder(fullPath, 'folder');
         } else if (action.action === 'create_file') {
           const fullPath = resolveActionPath(action.path, action.name);
-          const existing = findNode(updated, fullPath);
-          if (existing) {
-            updated = updateNodeContent(updated, fullPath, action.content);
-          } else {
-            updated = ensureFolderPath(updated, fullPath);
-            const newNode = createFileNode(action.name, fullPath, action.content);
-            newNode.language = action.language;
-            updated = [...updated, newNode];
-            const parent = fullPath.includes('/') ? fullPath.slice(0, fullPath.lastIndexOf('/')) : '';
-            if (parent) foldersToExpand.push(parent);
-          }
+          await saveFile(fullPath, action.content);
         }
+      } catch (err) {
+        console.error('Apply structured failed:', err);
       }
-      if (foldersToExpand.length > 0) {
-        setExpanded((e) => {
-          const next = new Set(e);
-          for (const f of foldersToExpand) next.add(f);
-          return next;
-        });
-      }
-      return updated;
-    });
-    // Open the first created file if any
+    }
+    await refreshTree();
     const firstFile = actions.find((a) => a.action === 'create_file');
     if (firstFile && firstFile.action === 'create_file') {
       const fullPath = resolveActionPath(firstFile.path, firstFile.name);
@@ -427,7 +341,7 @@ export default function App() {
         });
       }, 50);
     }
-  }, [handleOpenFile]);
+  }, [refreshTree, handleOpenFile]);
 
   const fileList = flattenFiles(files);
   const searchResults = searchQuery
@@ -467,7 +381,6 @@ export default function App() {
           {activeTab?.dirty && <span className="text-xs text-coal-500">— unsaved changes</span>}
         </div>
         <div className="flex items-center gap-3">
-          {/* Editor / Preview / Split view toggle */}
           <div className="flex items-center gap-0.5 rounded-md bg-coal-850 p-0.5">
             <button onClick={() => setMainView('editor')} title="Editör"
               className={`flex items-center gap-1 rounded px-2 py-1 text-[11px] transition-colors ${mainView === 'editor' ? 'bg-coal-700 text-accent-400' : 'text-coal-400 hover:text-coal-200'}`}>
@@ -513,6 +426,10 @@ export default function App() {
               <div className="flex items-center justify-between px-3 py-2">
                 <span className="text-xs font-semibold uppercase tracking-wider text-coal-400">Explorer</span>
                 <div className="flex items-center gap-0.5">
+                  <button onClick={refreshTree} title="Refresh"
+                    className="rounded p-1 text-coal-400 transition-colors hover:bg-coal-800 hover:text-coal-100">
+                    <RefreshCw size={14} className={treeLoading ? 'animate-spin' : ''} />
+                  </button>
                   <button onClick={handleNewFile}
                     className="rounded p-1 text-coal-400 transition-colors hover:bg-coal-800 hover:text-coal-100">
                     <FilePlus size={14} />
@@ -523,8 +440,10 @@ export default function App() {
                 </div>
               </div>
               <div className="flex-1 overflow-y-auto">
-                {files.length === 0 ? (
-                  <div className="px-3 py-6 text-center text-xs text-coal-500">No files yet. Create one to get started.</div>
+                {treeError ? (
+                  <div className="px-3 py-6 text-center text-xs text-red-400">{treeError}</div>
+                ) : files.length === 0 && !treeLoading ? (
+                  <div className="px-3 py-6 text-center text-xs text-coal-500">No files found.</div>
                 ) : files.map((node) => (
                   <FileTreeItem key={node.id} node={node} depth={0} expanded={expanded}
                     onToggle={handleToggleFolder} onOpen={handleOpenFile} onDelete={handleDeleteNode}
@@ -588,7 +507,6 @@ export default function App() {
           )}
 
           <div className="flex flex-1 overflow-hidden">
-            {/* Editor area */}
             {(mainView === 'editor' || mainView === 'split') && (
               <div className={`flex flex-col overflow-hidden ${mainView === 'split' ? 'flex-1 border-r border-coal-800' : 'flex-1'}`}>
                 {activeTab ? (
@@ -612,7 +530,6 @@ export default function App() {
               </div>
             )}
 
-            {/* Live Preview area */}
             {(mainView === 'preview' || mainView === 'split') && (
               <div className={mainView === 'split' ? 'flex-1' : 'flex-1'}>
                 <LivePreviewPanel files={files} activeTabName={activeTab?.name ?? null} autoRun={autoRun} />
@@ -649,3 +566,6 @@ export default function App() {
     </div>
   );
 }
+
+// Need to import Project type
+import type { Project } from './types';

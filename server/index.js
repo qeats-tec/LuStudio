@@ -10,7 +10,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
 
 const distPath = path.join(__dirname, '..', 'dist');
 if (fs.existsSync(distPath)) {
@@ -39,9 +39,115 @@ function getWorkspaceDir() {
   return '/tmp';
 }
 
-// Binary protocol:
-// - Binary frames = raw terminal data (both directions)
-// - Text frames   = JSON control messages: { type: "resize", cols, rows } | { type: "exit", exitCode }
+// ── Filesystem API ──────────────────────────────────────────────────────
+
+const EXCLUDED_DIRS = new Set(['node_modules', '.git', 'dist', '.cache', '.bolt']);
+
+function buildTree(dir, baseDir) {
+  let entries;
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const nodes = [];
+  for (const entry of entries) {
+    if (EXCLUDED_DIRS.has(entry.name)) continue;
+    const fullPath = path.join(dir, entry.name);
+    const relPath = path.relative(baseDir, fullPath);
+    if (entry.isDirectory()) {
+      const children = buildTree(fullPath, baseDir);
+      nodes.push({ name: entry.name, type: 'folder', path: relPath, children });
+    } else {
+      nodes.push({ name: entry.name, type: 'file', path: relPath });
+    }
+  }
+  return nodes.sort((a, b) => {
+    if (a.type !== b.type) return a.type === 'folder' ? -1 : 1;
+    return a.name.localeCompare(b.name);
+  });
+}
+
+function safePath(relPath) {
+  const workspace = getWorkspaceDir();
+  const resolved = path.resolve(workspace, relPath);
+  if (!resolved.startsWith(workspace + path.sep) && resolved !== workspace) {
+    return null;
+  }
+  return resolved;
+}
+
+app.get('/api/tree', (req, res) => {
+  const dir = getWorkspaceDir();
+  try {
+    const tree = buildTree(dir, dir);
+    res.json({ tree, cwd: dir });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/file', (req, res) => {
+  const filePath = safePath(req.query.path);
+  if (!filePath) return res.status(403).json({ error: 'Access denied' });
+  try {
+    const content = fs.readFileSync(filePath, 'utf8');
+    res.json({ content });
+  } catch (err) {
+    res.status(404).json({ error: err.message });
+  }
+});
+
+app.post('/api/file', (req, res) => {
+  const { path: relPath, content } = req.body;
+  const filePath = safePath(relPath);
+  if (!filePath) return res.status(403).json({ error: 'Access denied' });
+  try {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(filePath, content ?? '');
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/file/new', (req, res) => {
+  const { path: relPath, type } = req.body;
+  const filePath = safePath(relPath);
+  if (!filePath) return res.status(403).json({ error: 'Access denied' });
+  try {
+    if (type === 'folder') {
+      fs.mkdirSync(filePath, { recursive: true });
+    } else {
+      fs.mkdirSync(path.dirname(filePath), { recursive: true });
+      fs.writeFileSync(filePath, '');
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/file', (req, res) => {
+  const filePath = safePath(req.query.path);
+  if (!filePath) return res.status(403).json({ error: 'Access denied' });
+  try {
+    if (fs.statSync(filePath).isDirectory()) {
+      fs.rmSync(filePath, { recursive: true });
+    } else {
+      fs.unlinkSync(filePath);
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/cwd', (req, res) => {
+  res.json({ cwd: getWorkspaceDir() });
+});
+
+// ── Terminal WebSocket ───────────────────────────────────────────────────
 
 wss.on('connection', (ws, req) => {
   const id = Math.random().toString(36).slice(2);
@@ -73,20 +179,20 @@ wss.on('connection', (ws, req) => {
 
   terminals.set(id, term);
 
-  // Output buffer: batch small writes into larger frames for throughput
+  // Ensure terminal starts in the workspace directory (overrides any shell profile cd)
+  term.write(`cd "${cwd}"\r`);
+
   let outputBuffer = [];
   let flushTimer = null;
-  const FLUSH_MS = 8; // batch window
-  const MAX_BUFFER = 65536; // flush immediately if buffer gets this big
+  const FLUSH_MS = 8;
+  const MAX_BUFFER = 65536;
 
   function flushOutput() {
     flushTimer = null;
     if (outputBuffer.length === 0) return;
     const merged = Buffer.concat(outputBuffer);
     outputBuffer = [];
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(merged); // binary frame — zero JSON overhead
-    }
+    if (ws.readyState === WebSocket.OPEN) ws.send(merged);
   }
 
   function scheduleFlush() {
@@ -95,9 +201,7 @@ wss.on('connection', (ws, req) => {
       flushOutput();
       return;
     }
-    if (!flushTimer) {
-      flushTimer = setTimeout(flushOutput, FLUSH_MS);
-    }
+    if (!flushTimer) flushTimer = setTimeout(flushOutput, FLUSH_MS);
   }
 
   term.onData((data) => {
@@ -109,7 +213,7 @@ wss.on('connection', (ws, req) => {
     console.log(`[terminal] shell ${id} exited: ${exitCode}`);
     if (flushTimer) { clearTimeout(flushTimer); flushOutput(); }
     if (ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'exit', exitCode })); // text frame = control
+      ws.send(JSON.stringify({ type: 'exit', exitCode }));
       ws.close();
     }
     terminals.delete(id);
@@ -117,41 +221,33 @@ wss.on('connection', (ws, req) => {
 
   ws.on('message', (msg, isBinary) => {
     if (isBinary) {
-      // Binary frame = raw terminal input
-      try {
-        term.write(msg);
-      } catch (e) {
-        console.error('[terminal] write error:', e.message);
-      }
+      try { term.write(msg); } catch (e) { console.error('[terminal] write error:', e.message); }
     } else {
-      // Text frame = JSON control message
       try {
         const data = JSON.parse(msg.toString());
         if (data.type === 'resize') {
-          const cols = Math.max(1, data.cols || 80);
-          const rows = Math.max(1, data.rows || 24);
-          term.resize(cols, rows);
+          term.resize(Math.max(1, data.cols || 80), Math.max(1, data.rows || 24));
         }
-      } catch (e) {
-        console.error('[terminal] control parse error:', e.message);
-      }
+      } catch (e) { console.error('[terminal] control parse error:', e.message); }
     }
   });
 
   ws.on('close', () => {
     console.log(`[terminal] connection ${id} closed`);
-    if (flushTimer) { clearTimeout(flushTimer); }
+    if (flushTimer) clearTimeout(flushTimer);
     try { term.kill(); } catch { /* ignore */ }
     terminals.delete(id);
   });
 
   ws.on('error', (err) => {
     console.error(`[terminal] ws error ${id}:`, err.message);
-    if (flushTimer) { clearTimeout(flushTimer); }
+    if (flushTimer) clearTimeout(flushTimer);
     try { term.kill(); } catch { /* ignore */ }
     terminals.delete(id);
   });
 });
+
+// ── Health & catch-all ───────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', terminals: terminals.size, uptime: process.uptime() });
@@ -172,9 +268,7 @@ server.listen(PORT, HOST, () => {
 });
 
 function shutdown() {
-  for (const [, term] of terminals) {
-    try { term.kill(); } catch { /* ignore */ }
-  }
+  for (const [, term] of terminals) { try { term.kill(); } catch { /* ignore */ } }
   server.close(() => process.exit(0));
 }
 
