@@ -10,7 +10,6 @@ import { LivePreviewPanel } from './components/LivePreviewPanel';
 import { VisitorCounter } from './components/VisitorCounter';
 import { type AISettings } from './utils/ai';
 import type { FileNode, EditorTab, ChatMessage, AIFileAction, AIStructuredAction, SidebarView, Project } from './types';
-import { createDefaultProject } from './lib/defaultProject';
 import { flattenFiles, findNode, langForFile } from './lib/filesystem';
 
 const STORAGE_KEY_AI = 'lustudio_ai_settings';
@@ -136,19 +135,13 @@ export default function App() {
     if (saved) {
       try {
         const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+        if (Array.isArray(parsed)) return parsed;
       } catch {}
     }
-    // First visit: pre-load LuStudio's own code as the default project
-    return [createDefaultProject()];
+    return [];
   });
   const [activeProjectId, setActiveProjectId] = useState<string | null>(() => {
-    const saved = localStorage.getItem(STORAGE_KEY_ACTIVE);
-    if (saved) return saved;
-    // Auto-open the default project on first visit
-    const savedProjects = localStorage.getItem(STORAGE_KEY_PROJECTS);
-    if (!savedProjects) return null; // will be set after projects init
-    return null;
+    return localStorage.getItem(STORAGE_KEY_ACTIVE) || null;
   });
 
   const [expanded, setExpanded] = useState<Set<string>>(new Set(['src']));
@@ -165,13 +158,6 @@ export default function App() {
   const [autoRun, setAutoRun] = useState(true);
 
   const activeProject = projects.find((p) => p.id === activeProjectId) ?? null;
-
-  // Auto-open default project on first visit
-  useEffect(() => {
-    if (!activeProjectId && projects.length > 0) {
-      setActiveProjectId(projects[0].id);
-    }
-  }, [activeProjectId, projects]);
 
   // Persist projects
   useEffect(() => {
