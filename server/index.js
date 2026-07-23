@@ -25,16 +25,14 @@ const wss = new WebSocketServer({ server, path: '/terminal' });
 const terminals = new Map();
 
 // ── Per-project workspaces ───────────────────────────────────────────────
-// Each project gets its own directory on disk. The terminal runs inside it,
-// and files created in the terminal can be synced back to the Explorer.
 
 const WORKSPACES_ROOT = path.join(process.env.HOME || '/tmp', '.lustudio-workspaces');
 
-function getWorkspaceDir(projectId: string): string {
+function getWorkspaceDir(projectId) {
   return path.join(WORKSPACES_ROOT, projectId);
 }
 
-function ensureWorkspace(projectId: string): string {
+function ensureWorkspace(projectId) {
   const dir = getWorkspaceDir(projectId);
   fs.mkdirSync(dir, { recursive: true });
   return dir;
@@ -42,14 +40,14 @@ function ensureWorkspace(projectId: string): string {
 
 const EXCLUDED_DIRS = new Set(['node_modules', '.git', 'dist', '.cache', '.bolt']);
 
-function buildTree(dir: string, baseDir: string): unknown[] {
-  let entries: fs.Dirent[];
+function buildTree(dir, baseDir) {
+  let entries;
   try {
     entries = fs.readdirSync(dir, { withFileTypes: true });
   } catch {
     return [];
   }
-  const nodes: unknown[] = [];
+  const nodes = [];
   for (const entry of entries) {
     if (EXCLUDED_DIRS.has(entry.name)) continue;
     const fullPath = path.join(dir, entry.name);
@@ -60,13 +58,13 @@ function buildTree(dir: string, baseDir: string): unknown[] {
       nodes.push({ name: entry.name, type: 'file', path: relPath });
     }
   }
-  return nodes.sort((a: any, b: any) => {
+  return nodes.sort((a, b) => {
     if (a.type !== b.type) return a.type === 'folder' ? -1 : 1;
     return a.name.localeCompare(b.name);
   });
 }
 
-function safePath(projectId: string, relPath: string): string | null {
+function safePath(projectId, relPath) {
   const workspace = getWorkspaceDir(projectId);
   const resolved = path.resolve(workspace, relPath);
   if (!resolved.startsWith(workspace + path.sep) && resolved !== workspace) return null;
@@ -76,12 +74,11 @@ function safePath(projectId: string, relPath: string): string | null {
 // Sync localStorage files → disk workspace
 app.post('/api/workspace/:projectId', (req, res) => {
   const { projectId } = req.params;
-  const { files } = req.body as { files: Array<{ path: string; content: string; type: string }> };
+  const { files } = req.body;
   if (!Array.isArray(files)) return res.status(400).json({ error: 'files array required' });
 
   const workspace = ensureWorkspace(projectId);
 
-  // Write each file to disk
   for (const file of files) {
     if (file.type !== 'file') continue;
     const filePath = path.join(workspace, file.path);
@@ -107,7 +104,7 @@ app.get('/api/workspace/:projectId/tree', (req, res) => {
 // Read file from workspace
 app.get('/api/workspace/:projectId/file', (req, res) => {
   const { projectId } = req.params;
-  const filePath = safePath(projectId, req.query.path as string);
+  const filePath = safePath(projectId, req.query.path);
   if (!filePath) return res.status(403).json({ error: 'Access denied' });
   try {
     const content = fs.readFileSync(filePath, 'utf8');
@@ -117,10 +114,10 @@ app.get('/api/workspace/:projectId/file', (req, res) => {
   }
 });
 
-// Write file to workspace (when user saves in editor)
+// Write file to workspace
 app.post('/api/workspace/:projectId/file', (req, res) => {
   const { projectId } = req.params;
-  const { path: relPath, content } = req.body as { path: string; content: string };
+  const { path: relPath, content } = req.body;
   const filePath = safePath(projectId, relPath);
   if (!filePath) return res.status(403).json({ error: 'Access denied' });
   try {
@@ -142,13 +139,11 @@ function getShell() {
 wss.on('connection', (ws, req) => {
   const id = Math.random().toString(36).slice(2);
 
-  // Parse projectId from query string
   const url = new URL(req.url || '', 'http://localhost');
   const projectId = url.searchParams.get('projectId') || '';
   console.log(`[terminal] connection ${id} projectId=${projectId}`);
 
-  // Start in the project workspace dir, or fall back to a temp dir
-  let cwd: string;
+  let cwd;
   if (projectId) {
     cwd = ensureWorkspace(projectId);
   } else {
@@ -162,7 +157,7 @@ wss.on('connection', (ws, req) => {
     TERM: 'xterm-256color',
     FORCE_COLOR: '1',
     COLORTERM: 'truecolor',
-    PORT: '3000', // user apps use 3000, LuStudio uses its own port
+    PORT: '3000',
   };
 
   let term;
@@ -183,8 +178,8 @@ wss.on('connection', (ws, req) => {
 
   terminals.set(id, term);
 
-  let outputBuffer: Buffer[] = [];
-  let flushTimer: ReturnType<typeof setTimeout> | null = null;
+  let outputBuffer = [];
+  let flushTimer = null;
   const FLUSH_MS = 8;
   const MAX_BUFFER = 65536;
 
