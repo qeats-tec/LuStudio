@@ -3,14 +3,13 @@ import { Terminal as XTerm } from 'xterm';
 import { FitAddon } from 'xterm-addon-fit';
 import 'xterm/css/xterm.css';
 
-const TERMINAL_WS_URL = (() => {
-  const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
-  return `${proto}://${window.location.host}/terminal`;
-})();
-
 const encoder = new TextEncoder();
 
-export default function TerminalInner() {
+interface TerminalInnerProps {
+  projectId: string;
+}
+
+export default function TerminalInner({ projectId }: TerminalInnerProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<XTerm | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
@@ -19,6 +18,9 @@ export default function TerminalInner() {
 
   useEffect(() => {
     if (!containerRef.current) return;
+
+    const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+    const terminalWsUrl = `${proto}://${window.location.host}/terminal?projectId=${encodeURIComponent(projectId)}`;
 
     const term = new XTerm({
       cursorBlink: true,
@@ -47,7 +49,6 @@ export default function TerminalInner() {
         brightWhite: '#f5f5f5',
       },
       allowProposedApi: true,
-      // Performance: write directly without DOM batching
       fastScrollModifier: 'alt',
       scrollback: 5000,
     });
@@ -63,34 +64,28 @@ export default function TerminalInner() {
     term.writeln('\x1b[33mLuStudio Terminal\x1b[0m — connecting...');
 
     const connect = () => {
-      // binaryType = arraybuffer for fast binary reads
-      const ws = new WebSocket(TERMINAL_WS_URL);
+      const ws = new WebSocket(terminalWsUrl);
       ws.binaryType = 'arraybuffer';
       wsRef.current = ws;
 
       ws.onopen = () => {
         setConnected(true);
         term.writeln('\x1b[32m✓ Connected\x1b[0m');
-        // Send resize as text (JSON control message)
         ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
       };
 
       ws.onmessage = (event) => {
         if (event.data instanceof ArrayBuffer) {
-          // Binary frame = raw terminal output — decode and write directly
           const text = new TextDecoder('utf-8').decode(event.data);
           term.write(text);
         } else {
-          // Text frame = JSON control message
           try {
             const msg = JSON.parse(event.data);
             if (msg.type === 'exit')
               term.writeln(`\r\n\x1b[33m[process exited with code ${msg.exitCode}]\x1b[0m`);
             else if (msg.type === 'error')
               term.writeln(`\r\n\x1b[31m✗ ${msg.message}\x1b[0m`);
-          } catch {
-            /* ignore */
-          }
+          } catch { /* ignore */ }
         }
       };
 
@@ -109,7 +104,6 @@ export default function TerminalInner() {
 
     const inputDisposable = term.onData((data) => {
       if (wsRef.current?.readyState === WebSocket.OPEN) {
-        // Send raw bytes as binary frame — no JSON wrapping
         wsRef.current.send(encoder.encode(data));
       }
     });
@@ -118,7 +112,6 @@ export default function TerminalInner() {
     const resizeObserver = new ResizeObserver(() => {
       if (fitRef.current && termRef.current) {
         fitRef.current.fit();
-        // Debounce resize events
         if (resizeTimer) clearTimeout(resizeTimer);
         resizeTimer = setTimeout(() => {
           if (wsRef.current?.readyState === WebSocket.OPEN && termRef.current) {
@@ -141,11 +134,11 @@ export default function TerminalInner() {
       termRef.current = null;
       fitRef.current = null;
     };
-  }, []);
+  }, [projectId]);
 
   return (
     <div className="relative h-full">
-      <div className="absolute left-2 top-1 z-10 flex items-center resize-none items-center gap-1.5 text-xs text-coal-500 pointer-events-none">
+      <div className="absolute left-2 top-1 z-10 flex items-center gap-1.5 text-xs text-coal-500 pointer-events-none">
         <div className={`h-1.5 w-1.5 rounded-full ${connected ? 'bg-green-500' : 'bg-red-500'}`} />
         <span>{connected ? 'connected' : 'disconnected'}</span>
       </div>

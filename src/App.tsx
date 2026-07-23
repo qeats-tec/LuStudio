@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect } from 'react';
-import { Plus, FilePlus, FolderPlus, ChevronRight, ChevronDown, X, Save, Terminal as TerminalIcon, Trash2, ArrowLeft, Eye, Code as Code2, Zap } from 'lucide-react';
+import { Plus, FilePlus, FolderPlus, ChevronRight, ChevronDown, X, Save, Terminal as TerminalIcon, Trash2, ArrowLeft, Eye, Code as Code2, Zap, RefreshCw } from 'lucide-react';
 import Editor from '@monaco-editor/react';
 import { Sidebar } from './components/Sidebar';
 import { SettingsModal } from './components/SettingsModal';
@@ -10,7 +10,7 @@ import { LivePreviewPanel } from './components/LivePreviewPanel';
 import { VisitorCounter } from './components/VisitorCounter';
 import { type AISettings } from './utils/ai';
 import type { FileNode, EditorTab, ChatMessage, AIFileAction, AIStructuredAction, SidebarView, Project } from './types';
-import { flattenFiles, findNode, langForFile } from './lib/filesystem';
+import { flattenFiles, findNode, langForFile, syncToDisk, fetchDiskTree, mergeDiskIntoLocal } from './lib/filesystem';
 
 const STORAGE_KEY_AI = 'lustudio_ai_settings';
 const STORAGE_KEY_PROJECTS = 'lustudio_projects';
@@ -156,8 +156,36 @@ export default function App() {
   const [searchQuery, setSearchQuery] = useState('');
   const [mainView, setMainView] = useState<'editor' | 'preview' | 'split'>('editor');
   const [autoRun, setAutoRun] = useState(true);
+  const [treeLoading, setTreeLoading] = useState(false);
 
   const activeProject = projects.find((p) => p.id === activeProjectId) ?? null;
+
+  // Update active project's files
+  const updateActiveFiles = useCallback((updater: (files: FileNode[]) => FileNode[]) => {
+    setProjects((prev) => prev.map((p) =>
+      p.id === activeProjectId ? { ...p, files: updater(p.files), updatedAt: Date.now() } : p
+    ));
+  }, [activeProjectId]);
+
+  // When a project is opened, sync its localStorage files to disk so the terminal can see them
+  useEffect(() => {
+    if (!activeProject) return;
+    syncToDisk(activeProject.id, activeProject.files).catch((err) => console.error('syncToDisk failed:', err));
+  }, [activeProjectId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Refresh Explorer from disk: pull files created in the terminal into localStorage
+  const handleRefreshFromDisk = useCallback(async () => {
+    if (!activeProject) return;
+    setTreeLoading(true);
+    try {
+      const diskTree = await fetchDiskTree(activeProject.id);
+      updateActiveFiles((localFiles) => mergeDiskIntoLocal(localFiles, diskTree));
+    } catch (err) {
+      console.error('Refresh from disk failed:', err);
+    } finally {
+      setTreeLoading(false);
+    }
+  }, [activeProject, updateActiveFiles]);
 
   // Persist projects
   useEffect(() => {
@@ -178,13 +206,6 @@ export default function App() {
     setAiSettings(s);
     localStorage.setItem(STORAGE_KEY_AI, JSON.stringify(s));
   }, []);
-
-  // Update active project's files
-  const updateActiveFiles = useCallback((updater: (files: FileNode[]) => FileNode[]) => {
-    setProjects((prev) => prev.map((p) =>
-      p.id === activeProjectId ? { ...p, files: updater(p.files), updatedAt: Date.now() } : p
-    ));
-  }, [activeProjectId]);
 
   const handleCreateProject = useCallback((name: string) => {
     const project: Project = {
@@ -253,6 +274,8 @@ export default function App() {
   const handleSave = useCallback(() => {
     if (!activeTab || !activeProject) return;
     updateActiveFiles((files) => updateNodeContent(files, activeTab.path, activeTab.content));
+    // Also save to disk so the terminal can see the latest content
+    syncToDisk(activeProject.id, [{ id: '', name: '', type: 'file', path: activeTab.path, content: activeTab.content, language: activeTab.language }]).catch(() => {});
     setTabs((prev) => prev.map((t) => (t.id === activeTab.id ? { ...t, dirty: false } : t)));
   }, [activeTab, activeProject, updateActiveFiles]);
 
@@ -488,6 +511,10 @@ export default function App() {
               <div className="flex items-center justify-between px-3 py-2">
                 <span className="text-xs font-semibold uppercase tracking-wider text-coal-400">Explorer</span>
                 <div className="flex items-center gap-0.5">
+                  <button onClick={handleRefreshFromDisk} title="Sync from terminal"
+                    className="rounded p-1 text-coal-400 transition-colors hover:bg-coal-800 hover:text-coal-100">
+                    <RefreshCw size={14} className={treeLoading ? 'animate-spin' : ''} />
+                  </button>
                   <button onClick={handleNewRootFile} title="New file"
                     className="rounded p-1 text-coal-400 transition-colors hover:bg-coal-800 hover:text-coal-100">
                     <FilePlus size={14} />
@@ -597,7 +624,7 @@ export default function App() {
           </div>
 
           <div className={terminalOpen ? 'h-48 border-t border-coal-800' : 'h-9 border-t border-coal-800'}>
-            <TerminalPanel open={terminalOpen} onToggle={() => setTerminalOpen((o) => !o)} />
+            <TerminalPanel open={terminalOpen} onToggle={() => setTerminalOpen((o) => !o)} projectId={activeProject.id} onRefreshFiles={handleRefreshFromDisk} />
           </div>
         </div>
       </div>

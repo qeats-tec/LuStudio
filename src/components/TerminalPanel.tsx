@@ -1,14 +1,16 @@
 import { useState, lazy, Suspense } from 'react';
-import { ChevronDown, ChevronUp, Trash2, Terminal as TerminalIcon } from 'lucide-react';
+import { ChevronDown, ChevronUp, Trash2, Terminal as TerminalIcon, RefreshCw } from 'lucide-react';
 
 interface TerminalPanelProps {
   open: boolean;
   onToggle: () => void;
+  projectId: string;
+  onRefreshFiles: () => void;
 }
 
 const LazyTerminal = lazy(() => import('./TerminalInner'));
 
-export function TerminalPanel({ open, onToggle }: TerminalPanelProps) {
+export function TerminalPanel({ open, onToggle, projectId, onRefreshFiles }: TerminalPanelProps) {
   const [, forceRender] = useState(0);
 
   return (
@@ -19,6 +21,13 @@ export function TerminalPanel({ open, onToggle }: TerminalPanelProps) {
           <span className="text-xs font-medium text-coal-300">Terminal</span>
         </div>
         <div className="flex items-center gap-1">
+          <button
+            onClick={onRefreshFiles}
+            title="Sync files from terminal to Explorer"
+            className="rounded p-1.5 text-coal-400 transition-colors hover:bg-coal-800 hover:text-coal-100"
+          >
+            <RefreshCw size={14} />
+          </button>
           <button
             onClick={() => forceRender((n) => n + 1)}
             title="Clear terminal"
@@ -43,7 +52,7 @@ export function TerminalPanel({ open, onToggle }: TerminalPanelProps) {
               <div className="flex h-full items-center justify-center text-xs text-coal-500">Loading terminal...</div>
             }
           >
-            <LazyTerminal />
+            <LazyTerminal projectId={projectId} />
           </Suspense>
         </div>
       )}
