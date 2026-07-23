@@ -10,7 +10,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '50mb' }));
+app.use(express.json());
 
 const distPath = path.join(__dirname, '..', 'dist');
 if (fs.existsSync(distPath)) {
@@ -39,115 +39,14 @@ function getWorkspaceDir() {
   return '/tmp';
 }
 
-// ── Filesystem API ──────────────────────────────────────────────────────
-
-const EXCLUDED_DIRS = new Set(['node_modules', '.git', 'dist', '.cache', '.bolt']);
-
-function buildTree(dir, baseDir) {
-  let entries;
-  try {
-    entries = fs.readdirSync(dir, { withFileTypes: true });
-  } catch {
-    return [];
-  }
-  const nodes = [];
-  for (const entry of entries) {
-    if (EXCLUDED_DIRS.has(entry.name)) continue;
-    const fullPath = path.join(dir, entry.name);
-    const relPath = path.relative(baseDir, fullPath);
-    if (entry.isDirectory()) {
-      const children = buildTree(fullPath, baseDir);
-      nodes.push({ name: entry.name, type: 'folder', path: relPath, children });
-    } else {
-      nodes.push({ name: entry.name, type: 'file', path: relPath });
-    }
-  }
-  return nodes.sort((a, b) => {
-    if (a.type !== b.type) return a.type === 'folder' ? -1 : 1;
-    return a.name.localeCompare(b.name);
-  });
-}
-
-function safePath(relPath) {
-  const workspace = getWorkspaceDir();
-  const resolved = path.resolve(workspace, relPath);
-  if (!resolved.startsWith(workspace + path.sep) && resolved !== workspace) {
-    return null;
-  }
-  return resolved;
-}
-
-app.get('/api/tree', (req, res) => {
-  const dir = getWorkspaceDir();
-  try {
-    const tree = buildTree(dir, dir);
-    res.json({ tree, cwd: dir });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get('/api/file', (req, res) => {
-  const filePath = safePath(req.query.path);
-  if (!filePath) return res.status(403).json({ error: 'Access denied' });
-  try {
-    const content = fs.readFileSync(filePath, 'utf8');
-    res.json({ content });
-  } catch (err) {
-    res.status(404).json({ error: err.message });
-  }
-});
-
-app.post('/api/file', (req, res) => {
-  const { path: relPath, content } = req.body;
-  const filePath = safePath(relPath);
-  if (!filePath) return res.status(403).json({ error: 'Access denied' });
-  try {
-    fs.mkdirSync(path.dirname(filePath), { recursive: true });
-    fs.writeFileSync(filePath, content ?? '');
-    res.json({ ok: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/api/file/new', (req, res) => {
-  const { path: relPath, type } = req.body;
-  const filePath = safePath(relPath);
-  if (!filePath) return res.status(403).json({ error: 'Access denied' });
-  try {
-    if (type === 'folder') {
-      fs.mkdirSync(filePath, { recursive: true });
-    } else {
-      fs.mkdirSync(path.dirname(filePath), { recursive: true });
-      fs.writeFileSync(filePath, '');
-    }
-    res.json({ ok: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.delete('/api/file', (req, res) => {
-  const filePath = safePath(req.query.path);
-  if (!filePath) return res.status(403).json({ error: 'Access denied' });
-  try {
-    if (fs.statSync(filePath).isDirectory()) {
-      fs.rmSync(filePath, { recursive: true });
-    } else {
-      fs.unlinkSync(filePath);
-    }
-    res.json({ ok: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get('/api/cwd', (req, res) => {
-  res.json({ cwd: getWorkspaceDir() });
-});
-
 // ── Terminal WebSocket ───────────────────────────────────────────────────
+//
+// Binary protocol:
+//   Binary frames = raw PTY data (both directions)
+//   Text frames   = JSON control: { type: "resize", cols, rows } | { type: "exit", exitCode }
+//
+// The terminal environment gets a different PORT so user commands like
+// `npm start` or `node index.js` don't collide with LuStudio's own server.
 
 wss.on('connection', (ws, req) => {
   const id = Math.random().toString(36).slice(2);
@@ -156,6 +55,15 @@ wss.on('connection', (ws, req) => {
   const cwd = getWorkspaceDir();
   const shell = getShell();
 
+  // Give the terminal a different PORT so user apps don't conflict with LuStudio
+  const termEnv = {
+    ...process.env,
+    TERM: 'xterm-256color',
+    FORCE_COLOR: '1',
+    COLORTERM: 'truecolor',
+    PORT: '3000',
+  };
+
   let term;
   try {
     term = pty.spawn(shell, [], {
@@ -163,12 +71,7 @@ wss.on('connection', (ws, req) => {
       cols: 80,
       rows: 24,
       cwd,
-      env: {
-        ...process.env,
-        TERM: 'xterm-256color',
-        FORCE_COLOR: '1',
-        COLORTERM: 'truecolor',
-      },
+      env: termEnv,
     });
   } catch (err) {
     console.error('[terminal] pty spawn failed:', err.message);
@@ -179,9 +82,7 @@ wss.on('connection', (ws, req) => {
 
   terminals.set(id, term);
 
-  // Ensure terminal starts in the workspace directory (overrides any shell profile cd)
-  term.write(`cd "${cwd}"\r`);
-
+  // Batch small writes for throughput
   let outputBuffer = [];
   let flushTimer = null;
   const FLUSH_MS = 8;
