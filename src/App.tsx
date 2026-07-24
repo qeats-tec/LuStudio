@@ -9,8 +9,11 @@ import { ProjectDashboard } from './components/ProjectDashboard';
 import { LivePreviewPanel } from './components/LivePreviewPanel';
 import { VisitorCounter } from './components/VisitorCounter';
 import { type AISettings } from './utils/ai';
-import type { FileNode, EditorTab, ChatMessage, AIFileAction, AIStructuredAction, SidebarView, Project } from './types';
+import type { FileNode, EditorTab, ChatMessage, AIFileAction, AIStructuredAction, SidebarView, Project, GitHubConnection, RepoLink, GitHubRepo } from './types';
 import { flattenFiles, findNode, langForFile, syncToDisk, fetchDiskTree, mergeDiskIntoLocal } from './lib/filesystem';
+import { getConnection as getGHConnection, syncToGitHub } from './lib/githubService';
+import { GitHubPanel } from './components/GitHubPanel';
+import { RepoPickerModal } from './components/RepoPickerModal';
 
 const STORAGE_KEY_AI = 'lustudio_ai_settings';
 const STORAGE_KEY_PROJECTS = 'lustudio_projects';
@@ -157,6 +160,13 @@ export default function App() {
   const [mainView, setMainView] = useState<'editor' | 'preview' | 'split'>('editor');
   const [autoRun, setAutoRun] = useState(true);
   const [treeLoading, setTreeLoading] = useState(false);
+  const [githubConn, setGithubConn] = useState<GitHubConnection | null>(() => getGHConnection());
+  const [repoLink, setRepoLink] = useState<RepoLink | null>(() => {
+    const saved = localStorage.getItem('lustudio_repo_link');
+    if (saved) { try { return JSON.parse(saved); } catch { return null; } }
+    return null;
+  });
+  const [repoPickerOpen, setRepoPickerOpen] = useState(false);
 
   const activeProject = projects.find((p) => p.id === activeProjectId) ?? null;
 
@@ -206,6 +216,51 @@ export default function App() {
     setAiSettings(s);
     localStorage.setItem(STORAGE_KEY_AI, JSON.stringify(s));
   }, []);
+
+  // ── GitHub handlers ───────────────────────────────────────────────────
+  const handleGithubConnChange = useCallback((conn: GitHubConnection | null) => {
+    setGithubConn(conn);
+    if (!conn) setRepoLink(null);
+  }, []);
+
+  const handleRepoLinkChange = useCallback((link: RepoLink | null) => {
+    setRepoLink(link);
+    if (link) localStorage.setItem('lustudio_repo_link', JSON.stringify(link));
+    else localStorage.removeItem('lustudio_repo_link');
+  }, []);
+
+  const handleLinkRepo = useCallback((repo: GitHubRepo) => {
+    const link: RepoLink = {
+      owner: repo.owner.login,
+      repo: repo.name,
+      branch: repo.default_branch,
+      lastSync: null,
+    };
+    handleRepoLinkChange(link);
+    setRepoPickerOpen(false);
+  }, [handleRepoLinkChange]);
+
+  const handleImportFiles = useCallback((imported: Array<{ path: string; content: string }>) => {
+    if (!activeProject) return;
+    const newNodes: FileNode[] = imported.map((f) => ({
+      id: genId(), name: f.path.split('/').pop() || f.path, type: 'file' as const,
+      path: f.path, content: f.content, language: langForFile(f.path),
+    }));
+    updateActiveFiles(() => newNodes);
+  }, [activeProject, updateActiveFiles]);
+
+  // Auto-push debounce (5s after last change if autoRun + connected + linked)
+  useEffect(() => {
+    if (!githubConn || !repoLink || !activeProject || !autoRun) return;
+    const timer = setTimeout(() => {
+      const filesToPush = flattenFiles(activeProject.files).map((p) => {
+        const node = findNode(activeProject.files, p);
+        return { path: p, content: node?.content ?? '' };
+      });
+      syncToGitHub(githubConn.accessToken, repoLink.owner, repoLink.repo, repoLink.branch, filesToPush, 'Auto-sync via LuStudio').catch(() => {});
+    }, 5000);
+    return () => clearTimeout(timer);
+  }, [activeProject, githubConn, repoLink, autoRun]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleCreateProject = useCallback((name: string) => {
     const project: Project = {
@@ -503,6 +558,7 @@ export default function App() {
           onViewChange={setSidebarView}
           onOpenSettings={() => setSettingsOpen(true)}
           onOpenAI={() => setAiOpen(true)}
+          githubConnected={!!githubConn}
         />
 
         <div className="flex w-56 flex-col border-r border-coal-800 bg-coal-900">
@@ -563,6 +619,19 @@ export default function App() {
             <div className="flex flex-1 flex-col items-center justify-center px-4 text-center">
               <p className="text-sm text-coal-400">Extensions</p>
               <p className="mt-1 text-xs text-coal-500">No extensions installed.</p>
+            </div>
+          )}
+          {sidebarView === 'github' && (
+            <div className="flex flex-1 flex-col overflow-hidden">
+              <GitHubPanel
+                connection={githubConn}
+                onConnectionChange={handleGithubConnChange}
+                repoLink={repoLink}
+                onRepoLinkChange={handleRepoLinkChange}
+                onOpenRepoPicker={() => setRepoPickerOpen(true)}
+                files={activeProject.files}
+                onImportFiles={handleImportFiles}
+              />
             </div>
           )}
         </div>
@@ -649,6 +718,14 @@ export default function App() {
 
       <SettingsModal open={settingsOpen} onClose={() => setSettingsOpen(false)}
         settings={aiSettings} onSettingsChange={handleAiSettingsChange} />
+
+      <RepoPickerModal
+        open={repoPickerOpen}
+        onClose={() => setRepoPickerOpen(false)}
+        connection={githubConn!}
+        onLinkRepo={handleLinkRepo}
+        currentLink={repoLink}
+      />
     </div>
   );
 }

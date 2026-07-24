@@ -1,4 +1,4 @@
-import { Files, Search, Settings as SettingsIcon, Sparkles, FileCode2 } from 'lucide-react';
+import { Files, Search, Settings as SettingsIcon, Sparkles, FileCode2, Github } from 'lucide-react';
 import type { SidebarView } from '../types';
 
 interface SidebarProps {
@@ -6,12 +6,14 @@ interface SidebarProps {
   onViewChange: (view: SidebarView) => void;
   onOpenSettings: () => void;
   onOpenAI: () => void;
+  githubConnected?: boolean;
 }
 
-export function Sidebar({ view, onViewChange, onOpenSettings, onOpenAI }: SidebarProps) {
+export function Sidebar({ view, onViewChange, onOpenSettings, onOpenAI, githubConnected }: SidebarProps) {
   const items: { id: SidebarView; icon: typeof Files; label: string }[] = [
     { id: 'explorer', icon: Files, label: 'Explorer' },
     { id: 'search', icon: Search, label: 'Search' },
+    { id: 'github', icon: Github, label: 'GitHub' },
     { id: 'extensions', icon: FileCode2, label: 'Extensions' },
   ];
 
@@ -25,11 +27,14 @@ export function Sidebar({ view, onViewChange, onOpenSettings, onOpenAI }: Sideba
             key={item.id}
             onClick={() => onViewChange(item.id)}
             title={item.label}
-            className={`flex h-9 w-9 items-center justify-center rounded-lg transition-colors ${
+            className={`relative flex h-9 w-9 items-center justify-center rounded-lg transition-colors ${
               active ? 'bg-coal-800 text-accent-400' : 'text-coal-400 hover:text-coal-100'
             }`}
           >
             <Icon size={18} />
+            {item.id === 'github' && githubConnected && (
+              <span className="absolute right-1.5 top-1.5 h-2 w-2 rounded-full bg-green-500 ring-2 ring-coal-900" />
+            )}
           </button>
         );
       })}
